@@ -505,39 +505,45 @@ fn _set_tracked_assets(env: &Env, assets: &soroban_sdk::Vec<Symbol>) {
         .set(&DataKey::BaseCurrencyPairs, assets);
 }
 
-/// Get the price buffer for a specific asset.
-/// Returns a new empty buffer if none exists for the current ledger.
+/// Get the price buffer for a specific asset using a composite (Symbol, u64) key.
+///
+/// Each asset's buffer is stored under `DataKey::PriceBufferByAsset(asset, ledger_sequence)`
+/// so a single-asset read never loads any other asset's buffer, eliminating the
+/// gas cost of deserialising the old `Map<Symbol, PriceBuffer>` on every call.
+///
+/// If no buffer exists for the current ledger sequence a fresh empty one is returned.
 fn get_price_buffer(env: &Env, asset: Symbol) -> PriceBuffer {
-    let storage_key = DataKey::PriceBuffer;
-    let buffers: soroban_sdk::Map<Symbol, PriceBuffer> = env
-        .storage()
+    let current_seq = env.ledger().sequence() as u64;
+    let key = DataKey::PriceBufferByAsset(asset, current_seq);
+    env.storage()
         .persistent()
-        .get(&storage_key)
-        .unwrap_or_else(|| soroban_sdk::Map::new(env));
-
-    buffers.get(asset).unwrap_or_else(|| PriceBuffer {
-        entries: soroban_sdk::Vec::new(env),
-        ledger_sequence: env.ledger().sequence(),
-        decimals: 0,
-        ttl: 0,
-    })
+        .get(&key)
+        .unwrap_or_else(|| PriceBuffer {
+            entries: soroban_sdk::Vec::new(env),
+            ledger_sequence: env.ledger().sequence(),
+            decimals: 0,
+            ttl: 0,
+        })
 }
 
-/// Save the price buffer for a specific asset.
+/// Save the price buffer for a specific asset using a composite (Symbol, u64) key.
+///
+/// Writes only the single slot for `(asset, ledger_sequence)` — no other asset's
+/// buffer is touched or loaded.
 fn set_price_buffer(env: &Env, asset: Symbol, buffer: &PriceBuffer) {
-    let storage_key = DataKey::PriceBuffer;
-    let mut buffers: soroban_sdk::Map<Symbol, PriceBuffer> = env
-        .storage()
-        .persistent()
-        .get(&storage_key)
-        .unwrap_or_else(|| soroban_sdk::Map::new(env));
-
-    buffers.set(asset, buffer.clone());
-    env.storage().persistent().set(&storage_key, &buffers);
+    let seq = buffer.ledger_sequence as u64;
+    let key = DataKey::PriceBufferByAsset(asset, seq);
+    env.storage().persistent().set(&key, buffer);
 }
 
 /// Clear the price buffer if it's from a previous ledger.
-fn clear_stale_buffer(env: &Env, asset: Symbol, buffer: &mut PriceBuffer) {
+///
+/// With composite keys the buffer is already scoped to a specific ledger
+/// sequence, so staleness is implicit — a buffer from a prior ledger simply
+/// lives under a different key and is never returned by `get_price_buffer`.
+/// This function resets the in-memory buffer when the caller holds a buffer
+/// whose `ledger_sequence` no longer matches the current ledger.
+fn clear_stale_buffer(env: &Env, _asset: Symbol, buffer: &mut PriceBuffer) {
     let current_ledger = env.ledger().sequence();
     if buffer.ledger_sequence != current_ledger {
         buffer.entries = soroban_sdk::Vec::new(env);
@@ -623,12 +629,10 @@ fn _log_admin_action(env: &Env, admin: &Address, action: AdminAction, details: O
 }
 
 fn read_price_floor(env: &Env, asset: &Symbol) -> Option<i128> {
-    let floors: soroban_sdk::Map<Symbol, i128> = env
-        .storage()
+    // Composite key: one slot per asset — no map deserialisation overhead.
+    env.storage()
         .persistent()
-        .get(&DataKey::PriceFloorData)
-        .unwrap_or_else(|| soroban_sdk::Map::new(env));
-    floors.get(asset.clone())
+        .get(&DataKey::PriceFloorEntry(asset.clone()))
 }
 
 fn enforce_price_floor(env: &Env, asset: &Symbol, price: i128) -> Result<(), Error> {
@@ -1351,7 +1355,6 @@ impl PriceOracle {
         crate::auth::_require_not_frozen(&env);
         admin.require_auth();
         crate::auth::_require_authorized(&env, &admin);
-        //_log_admin_action(&env, &admin, AdminAction::RemoveAsset, Some(asset.to_string()));
 
         let storage = env.storage().persistent();
 
@@ -1366,6 +1369,9 @@ impl PriceOracle {
         storage.remove(&DataKey::VerifiedPrice(asset.clone()));
         storage.remove(&DataKey::CommunityPrice(asset.clone()));
         storage.remove(&DataKey::TrackedAsset(asset.clone()));
+        // Remove composite-key per-asset config slots.
+        storage.remove(&DataKey::PriceFloorEntry(asset.clone()));
+        storage.remove(&DataKey::PriceBoundsEntry(asset.clone()));
 
         let mut updated_assets = soroban_sdk::Vec::new(&env);
         for tracked_asset in get_tracked_assets(&env).iter() {
@@ -1374,6 +1380,29 @@ impl PriceOracle {
             }
         }
         _set_tracked_assets(&env, &updated_assets);
+
+        Ok(())
+    }
+
+    /// Batch-delete price entries for a list of assets.
+    ///
+    /// Removes the `DataKey::Price(asset)` slot for each asset in the supplied
+    /// vector. Capped at `MAX_CLEAR_ASSETS` (20) per call to bound gas usage.
+    /// Returns `Error::TooManyAssets` if the batch exceeds the limit — the call
+    /// is atomic so no entries are removed when the error fires.
+    ///
+    /// This function operates on the `DataKey::Price(Symbol)` composite key used
+    /// by snapshot tests and migration tooling. It does **not** touch
+    /// `VerifiedPrice` or `CommunityPrice` buckets; use `remove_asset` for that.
+    pub fn clear_assets(env: Env, assets: soroban_sdk::Vec<Symbol>) -> Result<(), Error> {
+        if assets.len() > MAX_CLEAR_ASSETS {
+            return Err(Error::TooManyAssets);
+        }
+
+        let storage = env.storage().persistent();
+        for asset in assets.iter() {
+            storage.remove(&DataKey::Price(asset));
+        }
 
         Ok(())
     }
@@ -1389,6 +1418,7 @@ impl PriceOracle {
         decimals: u32,
         confidence_score: u32,
         ttl: u64,
+
     ) -> Result<(), Error> {
         _require_not_destroyed(&env);
         crate::auth::_require_not_frozen(&env);
@@ -1467,13 +1497,13 @@ impl PriceOracle {
             enforce_price_floor(&env, &asset, normalized)?;
         }
 
-        let storage = env.storage().persistent();
-        let bounds_map: soroban_sdk::Map<Symbol, PriceBounds> = storage
-            .get(&DataKey::PriceBoundsData)
-            .unwrap_or_else(|| soroban_sdk::Map::new(&env));
-
+        // Composite key: read only this asset's bounds slot — no full map load.
         if !bypass_active {
-            if let Some(bounds) = bounds_map.get(asset.clone()) {
+            if let Some(bounds) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, PriceBounds>(&DataKey::PriceBoundsEntry(asset.clone()))
+            {
                 if normalized < bounds.min_price || normalized > bounds.max_price {
                     return Err(Error::PriceOutOfBounds);
                 }
@@ -1552,7 +1582,6 @@ impl PriceOracle {
         crate::auth::_require_not_frozen(&env);
         admin.require_auth();
         crate::auth::_require_authorized(&env, &admin);
-        //_log_admin_action(&env, &admin, AdminAction::SetPriceFloor, Some(format!("{}: {}", asset.to_string(), price_floor)));
 
         assert!(price_floor > 0, "price_floor must be positive");
 
@@ -1563,13 +1592,10 @@ impl PriceOracle {
             );
         }
 
-        let storage = env.storage().persistent();
-        let mut floor_map: soroban_sdk::Map<Symbol, i128> = storage
-            .get(&DataKey::PriceFloorData)
-            .unwrap_or_else(|| soroban_sdk::Map::new(&env));
-
-        floor_map.set(asset, price_floor);
-        storage.set(&DataKey::PriceFloorData, &floor_map);
+        // Composite key: write directly to the per-asset slot.
+        env.storage()
+            .persistent()
+            .set(&DataKey::PriceFloorEntry(asset), &price_floor);
     }
 
     /// Get the configured absolute floor price for an asset, if any.
@@ -1589,7 +1615,6 @@ impl PriceOracle {
         crate::auth::_require_not_frozen(&env);
         admin.require_auth();
         crate::auth::_require_authorized(&env, &admin);
-        //_log_admin_action(&env, &admin, AdminAction::SetPriceBounds, Some(format!("{}: min={}, max={}", asset.to_string(), min_price, max_price)));
 
         assert!(min_price > 0 && max_price > 0, "bounds must be positive");
         assert!(min_price <= max_price, "min_price must be <= max_price");
@@ -1597,29 +1622,19 @@ impl PriceOracle {
             assert!(price_floor <= max_price, "price_floor must be <= max_price");
         }
 
-        let storage = env.storage().persistent();
-        let mut bounds_map: soroban_sdk::Map<Symbol, PriceBounds> = storage
-            .get(&DataKey::PriceBoundsData)
-            .unwrap_or_else(|| soroban_sdk::Map::new(&env));
-
-        bounds_map.set(
-            asset,
-            PriceBounds {
-                min_price,
-                max_price,
-            },
+        // Composite key: write directly to the per-asset slot — no map load needed.
+        env.storage().persistent().set(
+            &DataKey::PriceBoundsEntry(asset),
+            &PriceBounds { min_price, max_price },
         );
-        storage.set(&DataKey::PriceBoundsData, &bounds_map);
     }
 
     /// Get the current min/max price bounds for an asset, if configured.
     pub fn get_price_bounds(env: Env, asset: Symbol) -> Option<PriceBounds> {
-        let bounds_map: soroban_sdk::Map<Symbol, PriceBounds> = env
-            .storage()
+        // Composite key: read only the single per-asset slot.
+        env.storage()
             .persistent()
-            .get(&DataKey::PriceBoundsData)
-            .unwrap_or_else(|| soroban_sdk::Map::new(&env));
-        bounds_map.get(asset)
+            .get(&DataKey::PriceBoundsEntry(asset))
     }
 
     /// Set the maximum allowed price deviation percentage (in basis points).

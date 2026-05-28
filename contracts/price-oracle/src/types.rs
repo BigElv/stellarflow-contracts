@@ -8,11 +8,17 @@ pub enum DataKey {
     BaseCurrencyPairs,
     /// Legacy flat price map — kept for migration compatibility only.
     PriceData,
+    /// Legacy single-key buffer map — superseded by PriceBufferByAsset(Symbol, u64).
+    /// Kept for migration compatibility only; no longer written by new code.
     PriceBuffer,
+    /// Legacy single-key bounds map — superseded by PriceBoundsEntry(Symbol).
+    /// Kept for migration compatibility only; no longer written by new code.
     PriceBoundsData,
     /// Configurable global maximum allowed price deviation in basis points.
     MaxPriceDeviationBps,
     IsLocked,
+    /// Legacy single-key floor map — superseded by PriceFloorEntry(Symbol).
+    /// Kept for migration compatibility only; no longer written by new code.
     PriceFloorData,
     AssetDescription(Symbol),
     PendingAdmin,
@@ -39,6 +45,26 @@ pub enum DataKey {
     PriceUpdateSubscribers,
     /// Tracked asset flag for O(1) existence check.
     TrackedAsset(Symbol),
+    /// Composite-key price buffer: one storage slot per (asset, ledger_sequence) pair.
+    ///
+    /// Replaces the legacy `PriceBuffer` map so a single-asset read no longer
+    /// loads every other asset's buffer. The `u64` component is the ledger
+    /// sequence number, which naturally scopes each buffer to one ledger.
+    PriceBufferByAsset(Symbol, u64),
+    /// Composite-key price bounds: one storage slot per asset.
+    ///
+    /// Replaces the legacy `PriceBoundsData` map so reading one asset's bounds
+    /// does not load bounds for every other asset.
+    PriceBoundsEntry(Symbol),
+    /// Composite-key price floor: one storage slot per asset.
+    ///
+    /// Replaces the legacy `PriceFloorData` map so reading one asset's floor
+    /// does not load floors for every other asset.
+    PriceFloorEntry(Symbol),
+    /// Composite-key price entry: one storage slot per (asset, sequence) pair.
+    ///
+    /// Used by `clear_assets` and snapshot tests that reference `DataKey::Price`.
+    Price(Symbol),
 }
 
 /// Decimal metadata for an asset pair.
@@ -259,4 +285,17 @@ pub struct ProposedAction {
     pub executed: bool,
     /// Whether the action has been cancelled.
     pub cancelled: bool,
+}
+
+/// A weighted component of a multi-asset index basket.
+///
+/// Used by `get_index_price` to compute a weighted average across assets.
+/// `weight` is expressed in basis points (e.g. 4000 = 40%).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AssetWeight {
+    /// The asset symbol (e.g. NGN, KES, GHS).
+    pub asset: Symbol,
+    /// Weight in basis points (0–10000). All weights in a basket should sum to 10000.
+    pub weight: u32,
 }
