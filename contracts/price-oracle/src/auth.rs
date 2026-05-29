@@ -14,6 +14,8 @@ pub enum DataKey {
     ActiveRelayers,
     CommunityCouncil,
     EmergencyFrozen,
+    /// Emergency halt flag — set by multi-sig governance to block all rate reads.
+    EmergencyHalt,
     /// Expiry timestamp (seconds) until which safety checks are bypassed.
     BypassSafetyChecks,
     /// Auto-incrementing counter for multi-sig action proposals.
@@ -308,6 +310,30 @@ pub fn _set_frozen(env: &Env, frozen: bool) {
 pub fn _require_not_frozen(env: &Env) {
     if _is_frozen(env) {
         panic!("Contract is in emergency freeze state");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Emergency Halt Helpers (multi-sig governance)
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub fn _is_halted(env: &Env) -> bool {
+    env.storage()
+        .instance()
+        .get::<DataKey, bool>(&DataKey::EmergencyHalt)
+        .unwrap_or(false)
+}
+
+pub fn _set_halted(env: &Env, status: bool) {
+    env.storage()
+        .instance()
+        .set(&DataKey::EmergencyHalt, &status);
+}
+
+/// Panic if the emergency halt flag is active.
+pub fn _require_not_halted(env: &Env) {
+    if _is_halted(env) {
+        panic!("Contract is emergency halted: rate reads are disabled");
     }
 }
 
