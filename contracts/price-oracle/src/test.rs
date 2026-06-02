@@ -2599,6 +2599,294 @@ fn test_self_destruct_emits_event() {
         crate::auth::_add_authorized(&env, &admin2);
     });
 
+    // Destroy the contract
+    client.self_destruct(&admin1, &admin2);
+
+    // Any admin-only function should now fail with ContractDestroyed
+    let dummy_hash = soroban_sdk::BytesN::from_array(&env, &[0u8; 32]);
+    client.upgrade(&admin1, &dummy_hash);
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Issue #369: Ledger-Sync | Enforcing Absolute Chronological Gaps Tests
+// ────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_ledger_gap_new_provider_allowed() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(PriceOracle, ());
+    let client = PriceOracleClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let asset = symbol_short!("NGN");
+
+    env.ledger().set_timestamp(1_000_000);
+    env.ledger().set_sequence(100);
+
+    client.init_admin(&admin);
+    client.add_asset(&admin, &asset).unwrap();
+
+    env.as_contract(&contract_id, || {
+        crate::auth::_add_provider(&env, &provider);
+    });
+
+    // First submission from a new provider should succeed (no ledger gap restriction)
+    let result = client.try_update_price(&provider, &asset, &100_000_000, &9, &95, &3600);
+    assert!(result.is_ok(), "New provider should be allowed to submit without ledger gap restriction");
+}
+
+#[test]
+fn test_ledger_gap_insufficient_gap_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(PriceOracle, ());
+    let client = PriceOracleClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let asset = symbol_short!("KES");
+
+    env.ledger().set_timestamp(1_000_000);
+    env.ledger().set_sequence(100);
+
+    client.init_admin(&admin);
+    client.add_asset(&admin, &asset).unwrap();
+
+    env.as_contract(&contract_id, || {
+        crate::auth::_add_provider(&env, &provider);
+    });
+
+    // First submission at ledger 100
+    let result1 = client.try_update_price(&provider, &asset, &100_000_000, &9, &95, &3600);
+    assert!(result1.is_ok(), "First submission should succeed");
+
+    // Try to submit again at ledger 102 (gap of 2 blocks, less than required 3)
+    env.ledger().set_sequence(102);
+    env.ledger().set_timestamp(1_000_100);
+
+    let result2 = client.try_update_price(&provider, &asset, &105_000_000, &9, &95, &3600);
+    match result2 {
+        Err(Ok(ContractError::LedgerGapTooSmall)) => {
+            // Expected!
+        }
+        other => panic!(
+            "Expected LedgerGapTooSmall error for insufficient gap, got: {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn test_ledger_gap_exactly_3_blocks_allowed() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(PriceOracle, ());
+    let client = PriceOracleClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let asset = symbol_short!("GHS");
+
+    env.ledger().set_timestamp(1_000_000);
+    env.ledger().set_sequence(100);
+
+    client.init_admin(&admin);
+    client.add_asset(&admin, &asset).unwrap();
+
+    env.as_contract(&contract_id, || {
+        crate::auth::_add_provider(&env, &provider);
+    });
+
+    // First submission at ledger 100
+    let result1 = client.try_update_price(&provider, &asset, &50_000_000, &9, &95, &3600);
+    assert!(result1.is_ok(), "First submission should succeed");
+
+    // Submit again at ledger 103 (gap of exactly 3 blocks)
+    env.ledger().set_sequence(103);
+    env.ledger().set_timestamp(1_000_100);
+
+    let result2 = client.try_update_price(&provider, &asset, &51_000_000, &9, &95, &3600);
+    assert!(
+        result2.is_ok(),
+        "Submission after exactly 3-block gap should succeed"
+    );
+}
+
+#[test]
+fn test_ledger_gap_more_than_3_blocks_allowed() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(PriceOracle, ());
+    let client = PriceOracleClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let asset = symbol_short!("CFA");
+
+    env.ledger().set_timestamp(1_000_000);
+    env.ledger().set_sequence(100);
+
+    client.init_admin(&admin);
+    client.add_asset(&admin, &asset).unwrap();
+
+    env.as_contract(&contract_id, || {
+        crate::auth::_add_provider(&env, &provider);
+    });
+
+    // First submission at ledger 100
+    let result1 = client.try_update_price(&provider, &asset, &75_000_000, &9, &95, &3600);
+    assert!(result1.is_ok(), "First submission should succeed");
+
+    // Submit again at ledger 150 (gap of 50 blocks, well above minimum)
+    env.ledger().set_sequence(150);
+    env.ledger().set_timestamp(1_001_000);
+
+    let result2 = client.try_update_price(&provider, &asset, &76_000_000, &9, &95, &3600);
+    assert!(
+        result2.is_ok(),
+        "Submission after 50-block gap should succeed"
+    );
+}
+
+#[test]
+fn test_ledger_gap_multiple_providers_independent() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(PriceOracle, ());
+    let client = PriceOracleClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let provider_a = Address::generate(&env);
+    let provider_b = Address::generate(&env);
+    let asset = symbol_short!("NGN");
+
+    env.ledger().set_timestamp(1_000_000);
+    env.ledger().set_sequence(100);
+
+    client.init_admin(&admin);
+    client.add_asset(&admin, &asset).unwrap();
+
+    env.as_contract(&contract_id, || {
+        crate::auth::_add_provider(&env, &provider_a);
+        crate::auth::_add_provider(&env, &provider_b);
+    });
+
+    // Provider A submits at ledger 100
+    let result_a1 = client.try_update_price(&provider_a, &asset, &100_000_000, &9, &95, &3600);
+    assert!(result_a1.is_ok(), "Provider A first submission should succeed");
+
+    // Provider B submits at ledger 101 (new provider, no gap restriction)
+    env.ledger().set_sequence(101);
+    let result_b1 = client.try_update_price(&provider_b, &asset, &102_000_000, &9, &95, &3600);
+    assert!(
+        result_b1.is_ok(),
+        "Provider B first submission should succeed (no gap restriction for new provider)"
+    );
+
+    // Provider A tries to submit at ledger 102 (gap of 2, fails)
+    env.ledger().set_sequence(102);
+    let result_a2 = client.try_update_price(&provider_a, &asset, &101_000_000, &9, &95, &3600);
+    match result_a2 {
+        Err(Ok(ContractError::LedgerGapTooSmall)) => {
+            // Expected!
+        }
+        other => panic!(
+            "Expected LedgerGapTooSmall for Provider A, got: {:?}",
+            other
+        ),
+    }
+
+    // Provider B tries to submit at ledger 103 (gap of 2 for B, fails)
+    env.ledger().set_sequence(103);
+    let result_b2 = client.try_update_price(&provider_b, &asset, &103_000_000, &9, &95, &3600);
+    match result_b2 {
+        Err(Ok(ContractError::LedgerGapTooSmall)) => {
+            // Expected!
+        }
+        other => panic!(
+            "Expected LedgerGapTooSmall for Provider B, got: {:?}",
+            other
+        ),
+    }
+
+    // Provider A submits at ledger 104 (gap of 4 from ledger 100, succeeds)
+    env.ledger().set_sequence(104);
+    let result_a3 = client.try_update_price(&provider_a, &asset, &104_000_000, &9, &95, &3600);
+    assert!(result_a3.is_ok(), "Provider A should succeed after 4-block gap");
+
+    // Provider B submits at ledger 105 (gap of 4 from ledger 101, succeeds)
+    env.ledger().set_sequence(105);
+    let result_b3 = client.try_update_price(&provider_b, &asset, &105_000_000, &9, &95, &3600);
+    assert!(result_b3.is_ok(), "Provider B should succeed after 4-block gap");
+}
+
+#[test]
+fn test_ledger_gap_provider_last_seen_ledger_tracking() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(PriceOracle, ());
+    let client = PriceOracleClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let asset = symbol_short!("KES");
+
+    env.ledger().set_timestamp(1_000_000);
+    env.ledger().set_sequence(100);
+
+    client.init_admin(&admin);
+    client.add_asset(&admin, &asset).unwrap();
+
+    env.as_contract(&contract_id, || {
+        crate::auth::_add_provider(&env, &provider);
+    });
+
+    // Initially, provider has no recorded last ledger
+    let last_ledger_before = client.get_provider_last_seen_ledger(&provider);
+    assert_eq!(last_ledger_before, 0, "New provider should have no recorded last ledger");
+
+    // First submission at ledger 100
+    client.update_price(&provider, &asset, &100_000_000, &9, &95, &3600);
+
+    // Provider's last seen ledger should now be 100
+    let last_ledger_after_first = client.get_provider_last_seen_ledger(&provider);
+    assert_eq!(
+        last_ledger_after_first, 100,
+        "Provider's last seen ledger should be updated to 100"
+    );
+
+    // Submit again at ledger 105
+    env.ledger().set_sequence(105);
+    env.ledger().set_timestamp(1_000_100);
+    client.update_price(&provider, &asset, &105_000_000, &9, &95, &3600);
+
+    // Provider's last seen ledger should now be 105
+    let last_ledger_after_second = client.get_provider_last_seen_ledger(&provider);
+    assert_eq!(
+        last_ledger_after_second, 105,
+        "Provider's last seen ledger should be updated to 105 after second submission"
+    );
+}
+
+    let contract_id = env.register(PriceOracle, ());
+    let client = PriceOracleClient::new(&env, &contract_id);
+
+    let admin1 = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
+    let admin2 = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
+
+    client.init_admin(&admin1);
+    env.as_contract(&contract_id, || {
+        crate::auth::_add_authorized(&env, &admin2);
+    });
+
     client.self_destruct(&admin1, &admin2);
 
     let events = env.events().all();
