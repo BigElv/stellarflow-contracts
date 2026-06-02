@@ -574,6 +574,8 @@ pub enum ContractError {
     InvalidPriceBounds = 46,
     /// Arithmetic operation overflow detected.
     PriceMathOverflow = 47,
+    /// Ledger gap too small - node must wait at least 3 blocks between submissions.
+    LedgerGapTooSmall = 53,
 }
 
 #[contract]
@@ -982,6 +984,44 @@ fn read_price_floor(env: &Env, asset: &Symbol) -> Option<i128> {
     env.storage()
         .persistent()
         .get(&DataKey::PriceFloorEntry(asset.clone()))
+}
+
+/// Enforce the 3-block minimum ledger gap between provider submissions.
+/// 
+/// Prevents high-frequency automated scripts from flooding the network with
+/// consecutive price updates within the same or nearby ledger windows.
+/// 
+/// # Arguments
+/// * `env` - The Soroban environment
+/// * `provider` - The address of the provider attempting to submit
+/// 
+/// # Returns
+/// * `Ok(())` if the provider is allowed to submit (3+ blocks since last submission)
+/// * `Err(ContractError::LedgerGapTooSmall)` if the gap is less than 3 blocks
+fn enforce_ledger_gap(env: &Env, provider: &Address) -> Result<(), ContractError> {
+    const MIN_LEDGER_GAP: u32 = 3;
+    
+    let current_ledger = env.ledger().sequence();
+    let last_seen = env
+        .storage()
+        .persistent()
+        .get(&DataKey::ProviderLastSeenLedger(provider.clone()))
+        .unwrap_or(0);
+    
+    // If provider has never submitted before, allow the submission
+    if last_seen == 0 {
+        return Ok(());
+    }
+    
+    // Calculate the gap between current and last submission
+    let gap = current_ledger.saturating_sub(last_seen);
+    
+    // Reject if the gap is less than MIN_LEDGER_GAP blocks
+    if gap < MIN_LEDGER_GAP {
+        return Err(ContractError::LedgerGapTooSmall);
+    }
+    
+    Ok(())
 }
 
 /// Extend the persistent storage TTL of a relayer node's profile entries if
@@ -2140,6 +2180,9 @@ impl PriceOracle {
         if !_is_whitelisted_provider(&env, &source) {
             return Err(ContractError::NotAuthorized);
         }
+
+        // Enforce 3-block minimum gap between this provider's submissions
+        enforce_ledger_gap(&env, &source)?;
 
         // Normalize the raw price to 9 fixed-point decimals on entry.
         let normalized = Self::normalize_price(&env, &asset, price);
