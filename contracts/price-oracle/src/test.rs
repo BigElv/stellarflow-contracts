@@ -1,7 +1,11 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{symbol_short, testutils::Address as _, testutils::Ledger, Address, Env};
+use soroban_sdk::{
+    symbol_short,
+    testutils::{Address as _, Events, Ledger},
+    Address, Env,
+};
 
 fn setup() -> (Env, PriceOracleClient<'static>) {
     let env = Env::default();
@@ -50,9 +54,10 @@ fn test_get_price_existing_asset() {
     env.ledger().set_timestamp(1_234_567_890);
     env.ledger().set_sequence_number(1);
 
-    let asset = symbol_short!("XLM");
+    let asset = symbol_short!("NGN");
     client.set_price(&asset, &1_000_000_i128);
 
+    let result = client.try_get_price(&asset);
     let retrieved_price = result.unwrap().unwrap();
     assert_eq!(retrieved_price.price, 1_000_000_i128);
     assert_eq!(retrieved_price.timestamp, 1_234_567_890);
@@ -89,11 +94,11 @@ fn test_get_price_multiple_assets() {
         .unwrap();
 
     assert_eq!(
-        client.try_get_price(&xlm_asset).unwrap().unwrap().price,
+        client.try_get_price(&ngn).unwrap().unwrap().price,
         1_000_000_i128
     );
     assert_eq!(
-        client.try_get_price(&btc_asset).unwrap().unwrap().price,
+        client.try_get_price(&kes).unwrap().unwrap().price,
         50_000_000_000_i128
     );
 }
@@ -103,7 +108,7 @@ fn test_get_price_after_update() {
     let env = Env::default();
     let contract_id = env.register(PriceOracle, ());
     let client = PriceOracleClient::new(&env, &contract_id);
-    let asset = symbol_short!("XLM");
+    let asset = symbol_short!("NGN");
 
     env.ledger().set_timestamp(1_234_567_890);
     env.ledger().set_sequence_number(1);
@@ -209,7 +214,7 @@ fn test_update_price_unauthorized_rejection() {
 
     client.update_price(
         &unauthorized_address,
-        &symbol_short!("BTC"),
+        &symbol_short!("NGN"),
         &50_000_000_000_i128,
     );
 }
@@ -247,7 +252,7 @@ fn test_update_price_multiple_updates() {
 
     let admin = Address::generate(&env);
     let provider = Address::generate(&env);
-    let asset = symbol_short!("XLM");
+    let asset = symbol_short!("NGN");
 
     env.as_contract(&contract_id, || {
         crate::auth::_set_admin(&env, &admin);
@@ -283,7 +288,7 @@ fn test_update_price_emits_event() {
     client.update_price(&provider, &asset, &price);
 
     let events = env.events().all();
-    assert!(!events.is_empty());
+    assert!(!events.events().is_empty());
 }
 
 #[test]

@@ -94,7 +94,11 @@ pub fn _require_provider(env: &Env, caller: &Address) {
 #[cfg(test)]
 mod auth_tests {
     use super::*;
-    use soroban_sdk::{contract, contractimpl, testutils::Address as _, Env};
+    use soroban_sdk::{
+        contract, contractimpl,
+        testutils::{Address as _, Events},
+        Env,
+    };
 
     #[contract]
     struct TestContract;
@@ -281,12 +285,12 @@ mod auth_tests {
         });
 
         let events = env.events().all();
-        assert!(!events.is_empty());
+        assert!(!events.events().is_empty());
     }
 
     #[test]
     fn test_set_admin_emits_event_on_admin_change() {
-        let (env, contract_id, old_admin) = setup();
+        let (env, contract_id, _old_admin) = setup();
         let new_admin = Address::generate(&env);
 
         env.as_contract(&contract_id, || {
@@ -294,6 +298,6 @@ mod auth_tests {
         });
 
         let events = env.events().all();
-        assert!(events.len() >= 2);
+        assert!(events.events().len() >= 2);
     }
 }

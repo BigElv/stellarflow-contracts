@@ -19,6 +19,18 @@ pub enum Error {
     Unauthorized = 2,
     /// Asset symbol is not in the approved list (NGN, KES, GHS)
     InvalidAssetSymbol = 3,
+    /// Stake withdrawal amount must be greater than zero.
+    InvalidStakeAmount = 4,
+    /// Validator already has a pending unbonding request.
+    UnbondingAlreadyQueued = 5,
+    /// Validator does not have an unbonding request.
+    UnbondingRequestNotFound = 6,
+    /// The minimum unbonding delay has not elapsed yet.
+    UnbondingDelayActive = 7,
+    /// The queued unbonding request was already released.
+    UnbondingAlreadyReleased = 8,
+    /// The current ledger plus the unbonding delay overflowed.
+    LedgerSequenceOverflow = 9,
 }
 
 /// Event emitted when a price is updated
@@ -110,8 +122,14 @@ impl PriceOracle {
         prices.keys()
     }
 
+    /// Return true when a price timestamp is older than 24 hours.
+    pub fn is_timestamp_stale(env: Env, timestamp: u64) -> bool {
+        let current_timestamp = env.ledger().timestamp();
+        current_timestamp > timestamp && current_timestamp - timestamp > 86_400
+    }
+
     /// Set the price data for a specific asset.
-    pub fn set_price(env: Env, asset: Symbol, val: i128) {
+    pub fn set_price(env: Env, asset: Symbol, val: i128) -> Result<(), Error> {
         let storage = env.storage().persistent();
         let mut prices: soroban_sdk::Map<Symbol, PriceData> = storage
             .get(&PRICE_DATA_KEY)
@@ -182,11 +200,39 @@ impl PriceOracle {
 
         Ok(())
     }
+
+    /// Queue a validator stake withdrawal behind the slashing delay.
+    pub fn request_stake_unbonding(
+        env: Env,
+        validator: Address,
+        amount: i128,
+    ) -> Result<slashing::UnbondingRequest, Error> {
+        slashing::request_unbonding(&env, &validator, amount)
+    }
+
+    /// Release a queued validator stake withdrawal after the delay expires.
+    pub fn release_unbonded_stake(env: Env, validator: Address) -> Result<i128, Error> {
+        slashing::release_unbonded_stake(&env, &validator)
+    }
+
+    /// Inspect a validator's queued unbonding request.
+    pub fn get_unbonding_request(
+        env: Env,
+        validator: Address,
+    ) -> Option<slashing::UnbondingRequest> {
+        slashing::get_unbonding_request(&env, &validator)
+    }
+
+    /// Return the enforced unbonding delay in ledgers.
+    pub fn min_unbonding_delay_ledgers() -> u32 {
+        slashing::MIN_UNBONDING_DELAY_LEDGERS
+    }
 }
 
 mod asset_symbol;
 mod auth;
 pub mod math;
 mod median;
+pub mod slashing;
 mod test;
 mod types;
