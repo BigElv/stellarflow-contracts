@@ -4,6 +4,8 @@ use soroban_sdk::{contract, contracterror, contractimpl, contracttype, symbol_sh
 pub(crate) mod nonce;
 use crate::nonce::{consume_nonce, get_nonce};
 
+pub mod consensus;
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -26,6 +28,7 @@ pub enum ContractError {
     AlreadyVoted = 16,
     ThresholdNotReached = 17,
     SignatureExpired = 18,
+    InvalidSaltSignature = 19,
 }
 
 // Contract state keys
@@ -55,6 +58,7 @@ pub struct RevocationProposal {
 }
 
 #[contracttype]
+#[derive(Clone)]
 pub struct PendingUpgrade {
     pub new_wasm_hash: BytesN<32>,
     pub proposed_at: u64,
@@ -202,11 +206,12 @@ impl TimeLockedUpgradeContract {
         Ok(())
     }
 
-    pub fn execute_upgrade(env: Env, executor: Address, _nonce: u64, sig_expires_at: u64) -> Result<(), ContractError> {
+    pub fn execute_upgrade(env: Env, executor: Address, nonce: u64, salt: Bytes, signature: BytesN<32>, sig_expires_at: u64) -> Result<(), ContractError> {
         if env.ledger().timestamp() > sig_expires_at { return Err(ContractError::SignatureExpired); }
         let data = Self::get_data(env.clone())?;
         if data.admin != executor { return Err(ContractError::NotAdmin); }
         executor.require_auth();
+        consume_nonce(&env, &executor, nonce, salt, signature)?;
         let pending: PendingUpgrade = env.storage().instance().get(&PENDING_UPGRADE_KEY).ok_or(ContractError::NoPendingUpgrade)?;
         if env.ledger().timestamp().saturating_sub(pending.proposed_at) < UPGRADE_DELAY_SECONDS {
             return Err(ContractError::UpgradeTimelockNotSatisfied);
@@ -214,6 +219,68 @@ impl TimeLockedUpgradeContract {
         env.deployer().update_current_contract_wasm(pending.new_wasm_hash);
         env.storage().instance().remove(&PENDING_UPGRADE_KEY);
         Ok(())
+    }
+
+    pub fn get_pending_upgrade(env: Env) -> Option<PendingUpgrade> {
+        env.storage().instance().get(&PENDING_UPGRADE_KEY)
+    }
+
+    pub fn get_upgrade_timelock_remaining(env: Env) -> Option<u64> {
+        env.storage().instance().get(&PENDING_UPGRADE_KEY).map(|pending: PendingUpgrade| {
+            let elapsed = env.ledger().timestamp().saturating_sub(pending.proposed_at);
+            UPGRADE_DELAY_SECONDS.saturating_sub(elapsed)
+        })
+    }
+
+    pub fn cancel_upgrade(env: Env, canceller: Address) -> Result<(), ContractError> {
+        let data = Self::get_data(env.clone())?;
+        if data.admin != canceller { return Err(ContractError::NotAdmin); }
+        canceller.require_auth();
+        env.storage().instance().remove(&PENDING_UPGRADE_KEY);
+        Ok(())
+    }
+
+    pub fn set_value(env: Env, new_value: u64, caller: Address, nonce: u64, salt: Bytes, signature: BytesN<32>, sig_expires_at: u64) -> Result<(), ContractError> {
+        if env.ledger().timestamp() > sig_expires_at { return Err(ContractError::SignatureExpired); }
+        let mut data = Self::get_data(env.clone())?;
+        if data.admin != caller { return Err(ContractError::NotAdmin); }
+        caller.require_auth();
+        consume_nonce(&env, &caller, nonce, salt, signature)?;
+        data.value = new_value;
+        env.storage().instance().set(&DATA_KEY, &data);
+        Self::_record_heartbeat(&env, symbol_short!("VALUE"));
+        Ok(())
+    }
+
+    pub fn get_coordinator_nonce(env: Env, coordinator: Address) -> u64 {
+        get_nonce(&env, &coordinator)
+    }
+
+    pub fn get_last_update_timestamp(env: Env, asset: Symbol) -> Option<u64> {
+        let timestamps: Map<Symbol, u64> = env.storage().temporary().get(&HEARTBEAT_KEY).unwrap_or_else(|| Map::new(&env));
+        timestamps.get(asset)
+    }
+
+    pub fn get_heartbeat_interval(env: Env) -> u64 {
+        Self::_get_interval(&env)
+    }
+
+    pub fn set_heartbeat_interval(env: Env, interval: u64, admin: Address) -> Result<(), ContractError> {
+        if interval == 0 { return Err(ContractError::InvalidHeartbeatInterval); }
+        let data = Self::get_data(env.clone())?;
+        if data.admin != admin { return Err(ContractError::NotAdmin); }
+        admin.require_auth();
+        env.storage().instance().set(&HB_INTERVAL_KEY, &interval);
+        Ok(())
+    }
+
+    pub fn get_stake(env: Env, node: Address) -> u64 {
+        let stakes: Map<Address, u64> = env.storage().instance().get(&STAKE_REGISTRY_KEY).unwrap_or_else(|| Map::new(&env));
+        stakes.get(node).unwrap_or(0u64)
+    }
+
+    pub fn get_total_staked(env: Env) -> u64 {
+        env.storage().instance().get(&TOTAL_STAKED_KEY).unwrap_or(0u64)
     }
 
     pub fn update_heartbeat(env: Env, asset: Symbol, updater: Address) -> Result<(), ContractError> {
@@ -343,6 +410,13 @@ impl TimeLockedUpgradeContract {
     }
 
     // --- Private Helpers ---
+
+    fn assert_contract_is_active(env: &Env) -> Result<(), ContractError> {
+        if !env.storage().instance().has(&DATA_KEY) {
+            return Err(ContractError::NotInitialized);
+        }
+        Ok(())
+    }
 
     fn _record_heartbeat(env: &Env, asset: Symbol) {
         let mut timestamps: Map<Symbol, u64> = env.storage().temporary().get(&HEARTBEAT_KEY).unwrap_or_else(|| Map::new(env));

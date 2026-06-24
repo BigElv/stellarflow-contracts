@@ -145,6 +145,7 @@ pub fn normalize_to_seven(value: i128, input_decimals: u32) -> Result<i128, Erro
     } else if input_decimals > 7 {
         let diff = input_decimals - 7;
         let divisor = 10_i128.checked_pow(diff).ok_or(Error::PriceMathOverflow)?;
+        require_nonzero_denominator(divisor)?;
         value.checked_div(divisor).ok_or(Error::PriceMathOverflow)
     } else {
         Ok(value)
@@ -167,23 +168,9 @@ pub fn normalize_to_seven(value: i128, input_decimals: u32) -> Result<i128, Erro
 /// normalize_to_nine(1_000_000_000_00, 11) => 1_000_000_000 (scale down)
 /// ```
 pub fn normalize_to_nine(value: i128, native_decimals: u32) -> Result<i128, Error> {
-    // This normalization is a critical fixed-point boundary.
-    // To reduce rounding/truncation drift when this function is used
-    // inside multi-step rate translations, we do the multiply/divide
-    // sequence in a temporarily up-scaled space.
-
     const TARGET: u32 = 9;
-    const INTERIOR_SCALE: i128 = 1_000_000_000_000_000; // 10^15
 
-    // NOTE: INTERIOR_SCALE is chosen so that the final result remains within
-    // the project's 9-decimal fixed-point footprint by dividing back down
-    // after the translation.
-
-    let scaled = value
-        .checked_mul(INTERIOR_SCALE)
-        .ok_or(Error::PriceMathOverflow)?;
-
-    let normalized_in_interior_space = if native_decimals < TARGET {
+    if native_decimals < TARGET {
         let diff = TARGET - native_decimals;
         let multiplier = 10_i128.checked_pow(diff).ok_or(Error::PriceMathOverflow)?;
         scaled
@@ -192,6 +179,7 @@ pub fn normalize_to_nine(value: i128, native_decimals: u32) -> Result<i128, Erro
     } else if native_decimals > TARGET {
         let diff = native_decimals - TARGET;
         let divisor = 10_i128.checked_pow(diff).ok_or(Error::PriceMathOverflow)?;
+        require_nonzero_denominator(divisor)?;
         scaled
             .checked_div(divisor)
             .ok_or(Error::PriceMathOverflow)?
@@ -199,6 +187,7 @@ pub fn normalize_to_nine(value: i128, native_decimals: u32) -> Result<i128, Erro
         scaled
     };
 
+    require_nonzero_denominator(INTERIOR_SCALE)?;
     normalized_in_interior_space
         .checked_div(INTERIOR_SCALE)
         .ok_or(Error::PriceMathOverflow)
@@ -226,6 +215,19 @@ pub fn calculate_inverse_price(price: i128, decimals: u32) -> Option<i128> {
     let scale = 10_i128.checked_pow(decimals)?;
     let numerator = scale.checked_mul(scale)?;
     numerator.checked_div(price)
+}
+
+/// Require that a denominator is non-zero before performing division.
+///
+/// Returns `Ok(())` when `n != 0`, or `Err(Error::InvalidDenominator)` when `n` is zero.
+/// Call this proactively before every division to prevent runtime panics
+/// and to provide a clear error signal to callers.
+pub fn require_nonzero_denominator(n: i128) -> Result<(), Error> {
+    if n == 0 {
+        Err(Error::InvalidDenominator)
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -365,5 +367,94 @@ mod tests {
     fn test_normalize_to_nine_zero_decimals() {
         // 0 native decimals → multiply by 10^9
         assert_eq!(normalize_to_nine(1, 0), Ok(1_000_000_000));
+    }
+
+    // --- require_nonzero_denominator tests -------------------------------------
+
+    #[test]
+    fn test_nonzero_denominator_accepts_positive() {
+        assert_eq!(require_nonzero_denominator(1), Ok(()));
+        assert_eq!(require_nonzero_denominator(i128::MAX), Ok(()));
+    }
+
+    #[test]
+    fn test_nonzero_denominator_accepts_negative() {
+        assert_eq!(require_nonzero_denominator(-1), Ok(()));
+        assert_eq!(require_nonzero_denominator(i128::MIN), Ok(()));
+    }
+
+    #[test]
+    fn test_nonzero_denominator_rejects_zero() {
+        assert_eq!(
+            require_nonzero_denominator(0),
+            Err(Error::InvalidDenominator)
+        );
+    }
+
+    // --- Edge-case normalization tests ------------------------------------------
+
+    #[test]
+    fn test_normalize_to_seven_zero_value() {
+        // Zero value is valid (does not trigger denominator check)
+        assert_eq!(normalize_to_seven(0, 2), Ok(0));
+        assert_eq!(normalize_to_seven(0, 9), Ok(0));
+        assert_eq!(normalize_to_seven(0, 7), Ok(0));
+    }
+
+    #[test]
+    fn test_normalize_to_seven_max_decimals() {
+        // Large input_decimals that still produces a valid divisor
+        assert_eq!(normalize_to_seven(1_000_000_000_000_000_000, 20), Ok(1));
+    }
+
+    #[test]
+    fn test_normalize_to_nine_zero_value() {
+        // Zero value is valid (does not trigger denominator check)
+        assert_eq!(normalize_to_nine(0, 2), Ok(0));
+        assert_eq!(normalize_to_nine(0, 9), Ok(0));
+        assert_eq!(normalize_to_nine(0, 11), Ok(0));
+    }
+
+    #[test]
+    fn test_normalize_to_nine_scale_down_max() {
+        // Large native_decimals that still produces a valid divisor
+        let result = normalize_to_nine(1_000_000_000_000_000_000_000, 18);
+        assert_eq!(result, Ok(1_000_000_000));
+    }
+
+    #[test]
+    fn test_normalize_to_seven_zero_input_decimals() {
+        // 0 input decimals → scale up by 10^7
+        assert_eq!(normalize_to_seven(1, 0), Ok(10_000_000));
+    }
+
+    #[test]
+    fn test_normalize_to_nine_negative_value() {
+        // Negative prices should normalize correctly
+        assert_eq!(normalize_to_nine(-1_000_000, 7), Ok(-100_000_000));
+    }
+
+    // --- Existing behavior unchanged -------------------------------------------
+
+    #[test]
+    fn test_deviation_bps_identical_still_works() {
+        assert_eq!(calculate_deviation_bps(10_000, 10_000), Ok(0));
+    }
+
+    #[test]
+    fn test_deviation_bps_above_consensus_still_works() {
+        assert_eq!(calculate_deviation_bps(10_100, 10_000), Ok(100));
+    }
+
+    #[test]
+    fn test_normalize_to_seven_still_works() {
+        assert_eq!(normalize_to_seven(150, 2), Ok(15_000_000));
+        assert_eq!(normalize_to_seven(100_000_000, 9), Ok(1_000_000));
+    }
+
+    #[test]
+    fn test_normalize_to_nine_still_works() {
+        assert_eq!(normalize_to_nine(10_000_000, 7), Ok(1_000_000_000));
+        assert_eq!(normalize_to_nine(100, 2), Ok(10_000_000_000));
     }
 }
