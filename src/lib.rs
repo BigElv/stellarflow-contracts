@@ -5,6 +5,10 @@ pub(crate) mod nonce;
 use crate::nonce::{consume_nonce, get_nonce};
 
 pub mod consensus;
+pub mod admin;
+
+#[cfg(test)]
+mod test;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -29,6 +33,8 @@ pub enum ContractError {
     ThresholdNotReached = 17,
     SignatureExpired = 18,
     InvalidSaltSignature = 19,
+    NoPendingOwner = 20,
+    TransferAlreadyPending = 21,
 }
 
 // Contract state keys
@@ -298,66 +304,6 @@ impl TimeLockedUpgradeContract {
         } else { false }
     }
 
-    pub fn set_value(env: Env, value: u64, admin: Address, nonce: u64, salt: Bytes, salt_signature: BytesN<32>, sig_expires_at: u64) -> Result<(), ContractError> {
-        if env.ledger().timestamp() > sig_expires_at { return Err(ContractError::SignatureExpired); }
-        let mut data = Self::get_data(env.clone())?;
-        if data.admin != admin { return Err(ContractError::NotAdmin); }
-        admin.require_auth();
-        consume_nonce(&env, &admin, nonce, salt, salt_signature);
-        data.value = value;
-        env.storage().instance().set(&DATA_KEY, &data);
-        Self::_record_heartbeat(&env, symbol_short!("VALUE"));
-        Ok(())
-    }
-
-    pub fn get_coordinator_nonce(env: Env, coordinator: Address) -> u64 {
-        get_nonce(&env, &coordinator)
-    }
-
-    pub fn get_pending_upgrade(env: Env) -> Option<PendingUpgrade> {
-        env.storage().instance().get(&PENDING_UPGRADE_KEY)
-    }
-
-    pub fn get_upgrade_timelock_remaining(env: Env) -> Option<u64> {
-        let pending: PendingUpgrade = env.storage().instance().get(&PENDING_UPGRADE_KEY)?;
-        Some(UPGRADE_DELAY_SECONDS.saturating_sub(env.ledger().timestamp().saturating_sub(pending.proposed_at)))
-    }
-
-    pub fn cancel_upgrade(env: Env, admin: Address) -> Result<(), ContractError> {
-        let data = Self::get_data(env.clone())?;
-        if data.admin != admin { return Err(ContractError::NotAdmin); }
-        admin.require_auth();
-        env.storage().instance().remove(&PENDING_UPGRADE_KEY);
-        Ok(())
-    }
-
-    pub fn set_heartbeat_interval(env: Env, interval: u64, admin: Address) -> Result<(), ContractError> {
-        if interval == 0 { return Err(ContractError::InvalidHeartbeatInterval); }
-        let data = Self::get_data(env.clone())?;
-        if data.admin != admin { return Err(ContractError::NotAdmin); }
-        admin.require_auth();
-        env.storage().instance().set(&HB_INTERVAL_KEY, &interval);
-        Ok(())
-    }
-
-    pub fn get_heartbeat_interval(env: Env) -> u64 {
-        Self::_get_interval(&env)
-    }
-
-    pub fn get_last_update_timestamp(env: Env, asset: Symbol) -> Option<u64> {
-        let timestamps: Map<Symbol, u64> = env.storage().temporary().get(&HEARTBEAT_KEY).unwrap_or_else(|| Map::new(&env));
-        timestamps.get(asset)
-    }
-
-    pub fn get_stake(env: Env, node: Address) -> u64 {
-        let stakes: Map<Address, u64> = env.storage().instance().get(&STAKE_REGISTRY_KEY).unwrap_or_else(|| Map::new(&env));
-        stakes.get(node).unwrap_or(0)
-    }
-
-    pub fn get_total_staked(env: Env) -> u64 {
-        env.storage().instance().get(&TOTAL_STAKED_KEY).unwrap_or(0)
-    }
-
     pub fn upsert_node_profile(env: Env, admin: Address, node: Address, rate: u64, confidence: u32) -> Result<(), ContractError> {
         let data = Self::get_data(env.clone())?;
         if data.admin != admin { return Err(ContractError::NotAdmin); }
@@ -409,6 +355,16 @@ impl TimeLockedUpgradeContract {
         Ok(())
     }
 
+    // --- Admin Ownership Transfer (Issue #429) ---
+
+    pub fn propose_ownership_transfer(env: Env, current_admin: Address, nominee: Address) -> Result<(), ContractError> {
+        admin::propose_ownership_transfer(&env, current_admin, nominee)
+    }
+
+    pub fn claim_ownership(env: Env, claimer: Address) -> Result<(), ContractError> {
+        admin::claim_ownership(&env, claimer)
+    }
+
     // --- Private Helpers ---
 
     fn assert_contract_is_active(env: &Env) -> Result<(), ContractError> {
@@ -455,13 +411,5 @@ impl TimeLockedUpgradeContract {
     fn _revocation_threshold(env: &Env) -> u32 {
         let n = Self::_get_signers(env).len();
         n / 2 + 1
-    }
-
-    fn assert_contract_is_active(env: &Env) -> Result<(), ContractError> {
-        if env.storage().instance().has(&DATA_KEY) {
-            Ok(())
-        } else {
-            Err(ContractError::NotInitialized)
-        }
     }
 }

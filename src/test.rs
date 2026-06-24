@@ -567,3 +567,99 @@ fn test_expired_signature_rejected() {
     let result = client.try_set_value(&42, &admin, &0, &salt2, &signature2, &expired_at);
     assert_eq!(result, Err(Ok(ContractError::SignatureExpired)));
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Two-Phase Admin Ownership Transfer tests (Issue #429)
+// ═════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_ownership_transfer_full_flow() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, TimeLockedUpgradeContract);
+    let client = TimeLockedUpgradeContractClient::new(&env, &contract_id);
+
+    let admin = soroban_sdk::Address::generate(&env);
+    let new_owner = soroban_sdk::Address::generate(&env);
+    client.initialize(&admin);
+
+    // Phase 1: current admin nominates new_owner
+    client.propose_ownership_transfer(&admin, &new_owner);
+
+    // Phase 2: new_owner claims, proving key access
+    client.claim_ownership(&new_owner);
+
+    // Ownership must have transferred
+    assert_eq!(client.get_data().admin, new_owner);
+}
+
+#[test]
+fn test_propose_ownership_transfer_requires_current_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, TimeLockedUpgradeContract);
+    let client = TimeLockedUpgradeContractClient::new(&env, &contract_id);
+
+    let admin = soroban_sdk::Address::generate(&env);
+    let intruder = soroban_sdk::Address::generate(&env);
+    let nominee = soroban_sdk::Address::generate(&env);
+    client.initialize(&admin);
+
+    let result = client.try_propose_ownership_transfer(&intruder, &nominee);
+    assert_eq!(result, Err(Ok(ContractError::NotAdmin)));
+}
+
+#[test]
+fn test_transfer_already_pending_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, TimeLockedUpgradeContract);
+    let client = TimeLockedUpgradeContractClient::new(&env, &contract_id);
+
+    let admin = soroban_sdk::Address::generate(&env);
+    let nominee = soroban_sdk::Address::generate(&env);
+    client.initialize(&admin);
+
+    client.propose_ownership_transfer(&admin, &nominee);
+
+    // Second proposal while one is already pending
+    let result = client.try_propose_ownership_transfer(&admin, &nominee);
+    assert_eq!(result, Err(Ok(ContractError::TransferAlreadyPending)));
+}
+
+#[test]
+fn test_claim_ownership_without_proposal_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, TimeLockedUpgradeContract);
+    let client = TimeLockedUpgradeContractClient::new(&env, &contract_id);
+
+    let admin = soroban_sdk::Address::generate(&env);
+    let stranger = soroban_sdk::Address::generate(&env);
+    client.initialize(&admin);
+
+    let result = client.try_claim_ownership(&stranger);
+    assert_eq!(result, Err(Ok(ContractError::NoPendingOwner)));
+}
+
+#[test]
+fn test_wrong_claimer_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, TimeLockedUpgradeContract);
+    let client = TimeLockedUpgradeContractClient::new(&env, &contract_id);
+
+    let admin = soroban_sdk::Address::generate(&env);
+    let nominee = soroban_sdk::Address::generate(&env);
+    let wrong_claimer = soroban_sdk::Address::generate(&env);
+    client.initialize(&admin);
+
+    client.propose_ownership_transfer(&admin, &nominee);
+
+    // A different address tries to claim
+    let result = client.try_claim_ownership(&wrong_claimer);
+    assert_eq!(result, Err(Ok(ContractError::NotAdmin)));
+
+    // Original admin is unchanged
+    assert_eq!(client.get_data().admin, admin);
+}
