@@ -59,6 +59,7 @@ const REVOCATION_KEY: Symbol = symbol_short!("REVOKE");
 const NODE_PROFILES_KEY: Symbol = symbol_short!("NODES");
 const PLATFORM_CAPITAL_KEY: Symbol = symbol_short!("CAPITAL");
 const CONSENSUS_CACHE_KEY: Symbol = symbol_short!("CACHE");
+const SEQUENCE_COUNTER_KEY: Symbol = symbol_short!("SEQ");
 const RELAYER_TTL_THRESHOLD: u32 = 5_000;
 
 #[contracttype]
@@ -262,12 +263,16 @@ impl TimeLockedUpgradeContract {
         Ok(())
     }
 
-    pub fn set_value(env: Env, new_value: u64, caller: Address, nonce: u64, salt: Bytes, signature: BytesN<32>, sig_expires_at: u64) -> Result<(), ContractError> {
+    pub fn set_value(env: Env, new_value: u64, caller: Address, nonce: u64, salt: Bytes, signature: BytesN<32>, sig_expires_at: u64, sequence: u64) -> Result<(), ContractError> {
         if env.ledger().timestamp() > sig_expires_at { return Err(ContractError::SignatureExpired); }
+        let mut seq_map: Map<Address, u64> = env.storage().instance().get(&SEQUENCE_COUNTER_KEY).unwrap_or_else(|| Map::new(&env));
+        if let Some(last_seq) = seq_map.get(caller.clone()) { if sequence <= last_seq { return Err(ContractError::InvalidNonce); } }
         let mut data = Self::get_data(env.clone())?;
         if data.admin != caller { return Err(ContractError::NotAdmin); }
         caller.require_auth();
         consume_nonce(&env, &caller, nonce, salt, signature)?;
+        seq_map.set(caller, sequence);
+        env.storage().instance().set(&SEQUENCE_COUNTER_KEY, &seq_map);
         data.value = new_value;
         env.storage().instance().set(&DATA_KEY, &data);
         Self::_record_heartbeat(&env, symbol_short!("VALUE"));
