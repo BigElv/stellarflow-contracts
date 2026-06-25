@@ -696,6 +696,12 @@ impl PriceOracle {
 
         result
     }
+
+    /// Claim accumulated rewards for a relayer. This is a thin wrapper that
+    /// delegates to the rewards module which enforces Checks-Effects-Interactions.
+    pub fn claim_rewards(env: Env, relayer: Address, token_contract: Address) -> i128 {
+        crate::rewards::Rewards::claim_rewards(env, relayer, token_contract)
+    }
 }
 
 mod asset_symbol;
@@ -704,3 +710,4 @@ pub mod math;
 mod median;
 mod test;
 mod types;
+mod rewards;

@@ -10,6 +10,8 @@ pub enum DataKey {
     PendingAdmin,
     PendingAdminTimestamp,
     RecentEvents,
+    /// Mapping of relayer address -> accumulated reward balance
+    Rewards,
     Initialized,
 }
 
