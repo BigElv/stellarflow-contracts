@@ -1432,8 +1432,15 @@ impl PriceOracle {
             .ok_or(ContractError::FeeTokenNotSet)?;
 
         let payer = env.invoker();
+        
+        // Acquire reentrancy lock before cross-contract call
+        crate::reentrancy::acquire_lock(env);
+        
         let token_client = token::Client::new(env, &token_address);
         token_client.transfer(&payer, &env.current_contract_address(), &fee);
+        
+        // Release reentrancy lock after cross-contract call
+        crate::reentrancy::release_lock(env);
 
         let provider_reward_key = DataKey::ProviderRewardBalance(provider.clone());
         let current_provider_rewards: i128 = env.storage().persistent().get(&provider_reward_key).unwrap_or(0);
@@ -1937,8 +1944,14 @@ impl PriceOracle {
             panic_with_error!(&env, ContractError::InvalidPrice);
         }
 
+        // Acquire reentrancy lock before cross-contract call
+        crate::reentrancy::acquire_lock(&env);
+        
         let token_client = token::Client::new(&env, &token);
         token_client.transfer(&env.current_contract_address(), &to, &amount);
+        
+        // Release reentrancy lock after cross-contract call
+        crate::reentrancy::release_lock(&env);
 
         env.events().publish(
             (Symbol::new(&env, "rescue_tokens_event"),),
@@ -2236,11 +2249,17 @@ impl PriceOracle {
             .persistent()
             .get::<DataKey, Address>(&DataKey::GasTank)
         {
+            // Acquire reentrancy lock before cross-contract call
+            crate::reentrancy::acquire_lock(&env);
+            
             // Call reimburse(relayer) on the Gas Tank contract.
             // We use env.invoke_contract so we stay no_std compatible.
             let reimburse_fn = Symbol::new(&env, "reimburse");
             let args = soroban_sdk::vec![&env, payload.provider.clone().to_val()];
             let _: () = env.invoke_contract(&gas_tank_addr, &reimburse_fn, args);
+            
+            // Release reentrancy lock after cross-contract call
+            crate::reentrancy::release_lock(&env);
         }
 
         Ok(())
@@ -3963,8 +3982,14 @@ impl PriceOracle {
             .ok_or(ContractError::SlashTokenNotSet)?;
 
         // Transfer tokens from the relayer into the contract.
+        // Acquire reentrancy lock before cross-contract call
+        crate::reentrancy::acquire_lock(&env);
+        
         let token_client = token::Client::new(&env, &token_address);
         token_client.transfer(&relayer, &env.current_contract_address(), &amount);
+        
+        // Release reentrancy lock after cross-contract call
+        crate::reentrancy::release_lock(&env);
 
         // Credit the relayer's on-chain stake balance.
         let current_stake: i128 = env
@@ -4026,8 +4051,14 @@ impl PriceOracle {
             .set(&DataKey::ProviderStake(relayer.clone()), &new_stake);
 
         // Return tokens to the relayer.
+        // Acquire reentrancy lock before cross-contract call
+        crate::reentrancy::acquire_lock(&env);
+        
         let token_client = token::Client::new(&env, &token_address);
         token_client.transfer(&env.current_contract_address(), &relayer, &amount);
+        
+        // Release reentrancy lock after cross-contract call
+        crate::reentrancy::release_lock(&env);
 
         env.events().publish(
             (Symbol::new(&env, "stake_withdrawn"),),
