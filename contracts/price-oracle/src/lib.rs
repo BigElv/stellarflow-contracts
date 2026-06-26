@@ -492,6 +492,8 @@ pub enum ContractError {
     SlippageToleranceExceeded = 10,
     /// Invalid slippage tolerance - must be between 0 and 10000 basis points (0-100%).
     InvalidSlippageTolerance = 11,
+    /// Fewer than three independent node sources contributed to the current consensus pool.
+    IncompleteQuorum = 12,
 }
 
 pub type Error = ContractError;
@@ -518,6 +520,15 @@ pub struct BypassEnabledEvent {
 
 pub struct BypassDisabledEvent {
     pub admin: Address,
+}
+
+// New event for logging price variance (percentage change in basis points)
+#[soroban_sdk::contractevent]
+pub struct PriceVarianceEvent {
+    pub asset: Symbol,
+    pub old_price: i128,
+    pub new_price: i128,
+    pub variance_bps: i128,
 }
 
 /// Emitted when a relayer's staked collateral is slashed by governance.
@@ -670,18 +681,9 @@ fn acquire_lock(env: &Env) -> Result<(), ContractError> {
         return Err(ContractError::ReentrancyDetected);
     }
 
-    /// Return true when a price timestamp is older than 24 hours.
-    pub fn is_timestamp_stale(env: Env, timestamp: u64) -> bool {
-        let current_timestamp = env.ledger().timestamp();
-        current_timestamp > timestamp && current_timestamp - timestamp > 86_400
-    }
-
-    /// Set the price data for a specific asset.
-    pub fn set_price(env: Env, asset: Symbol, val: i128) -> Result<(), Error> {
-        let storage = env.storage().persistent();
-        let mut prices: soroban_sdk::Map<Symbol, PriceData> = storage
-            .get(&PRICE_DATA_KEY)
-            .unwrap_or_else(|| soroban_sdk::Map::new(&env));
+    env.storage().temporary().set(&DataKey::IsLocked, &true);
+    Ok(())
+}
 
 /// Release the reentrancy lock for set_price.
 fn release_lock(env: &Env) {
@@ -1430,8 +1432,15 @@ impl PriceOracle {
             .ok_or(ContractError::FeeTokenNotSet)?;
 
         let payer = env.invoker();
+        
+        // Acquire reentrancy lock before cross-contract call
+        crate::reentrancy::acquire_lock(env);
+        
         let token_client = token::Client::new(env, &token_address);
         token_client.transfer(&payer, &env.current_contract_address(), &fee);
+        
+        // Release reentrancy lock after cross-contract call
+        crate::reentrancy::release_lock(env);
 
         let provider_reward_key = DataKey::ProviderRewardBalance(provider.clone());
         let current_provider_rewards: i128 = env.storage().persistent().get(&provider_reward_key).unwrap_or(0);
@@ -1761,6 +1770,7 @@ impl PriceOracle {
             let storage = env.storage().persistent();
             let key = DataKey::VerifiedPrice(asset.clone());
             let existing: Option<PriceData> = storage.get(&key);
+            let old_price_opt = existing.as_ref().map(|p| p.price);
             let is_new_asset = existing.is_none();
 
             _track_asset(&env, asset.clone());
@@ -1820,6 +1830,17 @@ impl PriceOracle {
                     (Symbol::new(&env, "price_updated_event"),),
                     (asset.clone(), normalized),
                 );
+            }
+            // Emit variance event for price change
+            if let Some(old_price) = old_price_opt {
+                let variance_opt = calculate_percentage_change_bps(old_price, normalized);
+                env.events().publish_event(&PriceVarianceEvent {
+                    asset: asset.clone(),
+                    old_price,
+                    new_price: normalized,
+                    variance_bps: variance_opt.unwrap_or(0),
+                });
+                log_event(&env, Symbol::new(&env, "price_variance"), asset.clone(), variance_opt.unwrap_or(0));
             }
 
             // Notify subscribers of the price update
@@ -1923,8 +1944,14 @@ impl PriceOracle {
             panic_with_error!(&env, ContractError::InvalidPrice);
         }
 
+        // Acquire reentrancy lock before cross-contract call
+        crate::reentrancy::acquire_lock(&env);
+        
         let token_client = token::Client::new(&env, &token);
         token_client.transfer(&env.current_contract_address(), &to, &amount);
+        
+        // Release reentrancy lock after cross-contract call
+        crate::reentrancy::release_lock(&env);
 
         env.events().publish(
             (Symbol::new(&env, "rescue_tokens_event"),),
@@ -2131,6 +2158,11 @@ impl PriceOracle {
             timestamp: env.ledger().timestamp(),
         };
         buffer.entries.push_back(entry);
+
+        if !bypass_active {
+            validation::validate_consensus_quorum(&env, &buffer)?;
+        }
+
         // Buffer decimals are always 9 after normalization.
         buffer.decimals = 9;
         buffer.ttl = ttl;
@@ -2217,11 +2249,17 @@ impl PriceOracle {
             .persistent()
             .get::<DataKey, Address>(&DataKey::GasTank)
         {
+            // Acquire reentrancy lock before cross-contract call
+            crate::reentrancy::acquire_lock(&env);
+            
             // Call reimburse(relayer) on the Gas Tank contract.
             // We use env.invoke_contract so we stay no_std compatible.
             let reimburse_fn = Symbol::new(&env, "reimburse");
             let args = soroban_sdk::vec![&env, payload.provider.clone().to_val()];
             let _: () = env.invoke_contract(&gas_tank_addr, &reimburse_fn, args);
+            
+            // Release reentrancy lock after cross-contract call
+            crate::reentrancy::release_lock(&env);
         }
 
         Ok(())
@@ -3944,8 +3982,14 @@ impl PriceOracle {
             .ok_or(ContractError::SlashTokenNotSet)?;
 
         // Transfer tokens from the relayer into the contract.
+        // Acquire reentrancy lock before cross-contract call
+        crate::reentrancy::acquire_lock(&env);
+        
         let token_client = token::Client::new(&env, &token_address);
         token_client.transfer(&relayer, &env.current_contract_address(), &amount);
+        
+        // Release reentrancy lock after cross-contract call
+        crate::reentrancy::release_lock(&env);
 
         // Credit the relayer's on-chain stake balance.
         let current_stake: i128 = env
@@ -4007,8 +4051,14 @@ impl PriceOracle {
             .set(&DataKey::ProviderStake(relayer.clone()), &new_stake);
 
         // Return tokens to the relayer.
+        // Acquire reentrancy lock before cross-contract call
+        crate::reentrancy::acquire_lock(&env);
+        
         let token_client = token::Client::new(&env, &token_address);
         token_client.transfer(&env.current_contract_address(), &relayer, &amount);
+        
+        // Release reentrancy lock after cross-contract call
+        crate::reentrancy::release_lock(&env);
 
         env.events().publish(
             (Symbol::new(&env, "stake_withdrawn"),),
@@ -4167,6 +4217,7 @@ mod callbacks;
 mod delegate_tests;
 pub mod math;
 mod median;
+mod slashing;
 pub mod slashing;
 mod test;
 mod types;
