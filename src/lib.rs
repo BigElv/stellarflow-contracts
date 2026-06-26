@@ -55,6 +55,7 @@ pub mod staking_tiers;
 pub mod governance;
 use crate::governance::{verify_staged_delay, StagedUpgrade};
 
+pub mod validation;
 pub use staking_tiers::{AssetFeedMetrics, StakingTier, StakingTierConfig};
 use staking_tiers::{
     assign_tier, effective_volume_score, required_stake_for_tier, validate_tier_config,
@@ -96,6 +97,9 @@ pub enum ContractError {
     TransferAlreadyPending = 24,
     /// No pending owner nominee exists to claim ownership.
     NoPendingOwner = 25,
+    /// Incoming telemetry payload timestamp is older than the maximum
+    /// allowed age (60 seconds behind the current ledger block time).
+    StaleTelemetryPayload = 26,
 }
 
 // Contract state keys
