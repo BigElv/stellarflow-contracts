@@ -2,7 +2,7 @@ use soroban_sdk::{Address, Env, Map, Vec};
 use crate::{ContractData, ContractError, DATA_KEY, SIGNERS_KEY};
 
 /// Rigid multi-signature confirmation barrier for parameter shift actions.
-/// Requires a minimum of 2 out of 3 validated administrative signatures
+/// Requires a supermajority of 4 out of 5 validated administrative signatures
 /// before approving changes to system boundary configurations.
 pub fn require_multisig(env: &Env, signers: &Vec<Address>) -> Result<(), ContractError> {
     let authorized_signers: Map<Address, ()> = env
@@ -17,24 +17,28 @@ pub fn require_multisig(env: &Env, signers: &Vec<Address>) -> Result<(), Contrac
         .get(&DATA_KEY)
         .ok_or(ContractError::NotInitialized)?;
 
-    let mut valid_count = 0;
-    let mut verified: Map<Address, ()> = Map::new(env);
+    let mut valid_count = 0u32;
 
-    for i in 0..signers.len() {
-        let signer = signers.get(i).unwrap();
-        let is_authorized = authorized_signers.contains_key(signer.clone()) || data.admin == signer;
-        
-        if is_authorized && !verified.contains_key(signer.clone()) {
-            signer.require_auth();
-            verified.set(signer.clone(), ());
-            valid_count += 1;
+    for (idx, signer) in signers.iter().enumerate() {
+        // Avoid repeated signature validation for duplicate signers in the same request.
+        if signers.iter().take(idx).any(|previous| previous == signer) {
+            continue;
+        }
+
+        let is_authorized = authorized_signers.contains_key(signer.clone()) || data.admin == *signer;
+        if !is_authorized {
+            continue;
+        }
+
+        signer.require_auth();
+        valid_count += 1;
+        if valid_count >= 2 {
+            break;
         }
     }
 
-    // Require a minimum of 2 validated administrative signatures
-    if valid_count < 2 {
+    // Require a supermajority of 4 out of 5 validated administrative signatures
+    if valid_count < 4 {
         return Err(ContractError::ThresholdNotReached);
     }
-
-    Ok(())
 }
