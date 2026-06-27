@@ -98,8 +98,8 @@ pub enum ContractError {
     TransferAlreadyPending = 24,
     /// No pending owner nominee exists to claim ownership.
     NoPendingOwner = 25,
-    /// Contract is in emergency-paused state; consumer endpoints are blocked.
-    ContractPaused = 26,
+    /// Incoming tracking sequence is less than or equal to the active stored checkpoint value.
+    StaleSequence = 26,
 }
 
 // Contract state keys
