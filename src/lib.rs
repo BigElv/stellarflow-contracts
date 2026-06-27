@@ -57,6 +57,7 @@ pub mod staking_tiers;
 pub mod governance;
 use crate::governance::{verify_staged_delay, StagedUpgrade};
 
+pub mod validation;
 pub use staking_tiers::{AssetFeedMetrics, StakingTier, StakingTierConfig};
 use staking_tiers::{
     assign_tier, effective_volume_score, required_stake_for_tier, validate_tier_config,
