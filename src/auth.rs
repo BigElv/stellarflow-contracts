@@ -41,7 +41,7 @@ pub fn require_multisig(env: &Env, signers: &Vec<Address>) -> Result<(), Contrac
         .instance()
         .get(&SIGNERS_KEY)
         .unwrap_or_else(|| Map::new(env));
-        
+
     let data: ContractData = env
         .storage()
         .instance()
